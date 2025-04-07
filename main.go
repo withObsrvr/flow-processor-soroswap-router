@@ -330,8 +330,15 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 			// Check if this is a Soroswap event
 			isSoroswapEvent := false
 			if firstTopic.Type == 14 { // Type 14 is Str
-				if firstTopic.Value == "SoroswapRouter" || firstTopic.Value == "SoroswapPair" {
-					isSoroswapEvent = true
+				// Decode the base64 value
+				var decodedValue struct {
+					Type  string `json:"type"`
+					Value string `json:"value"`
+				}
+				if err := json.Unmarshal([]byte(firstTopic.Value), &decodedValue); err == nil {
+					if decodedValue.Value == "SoroswapRouter" || decodedValue.Value == "SoroswapPair" {
+						isSoroswapEvent = true
+					}
 				}
 			}
 
@@ -343,15 +350,25 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 			// Determine event type
 			var eventType string
 			if secondTopic.Type == 15 { // Type 15 is Sym
-				switch secondTopic.Sym {
-				case "swap":
-					eventType = EventTypeSwap
-				case "add":
-					eventType = EventTypeAdd
-				case "remove":
-					eventType = EventTypeRemove
-				default:
-					log.Printf("Unknown Soroswap event type: %s", secondTopic.Sym)
+				// Decode the base64 value
+				var decodedValue struct {
+					Type  string `json:"type"`
+					Value string `json:"value"`
+				}
+				if err := json.Unmarshal([]byte(secondTopic.Value), &decodedValue); err == nil {
+					switch decodedValue.Value {
+					case "swap":
+						eventType = EventTypeSwap
+					case "add":
+						eventType = EventTypeAdd
+					case "remove":
+						eventType = EventTypeRemove
+					default:
+						log.Printf("Unknown Soroswap event type: %s", decodedValue.Value)
+						continue
+					}
+				} else {
+					log.Printf("Error decoding second topic value: %v", err)
 					continue
 				}
 			} else {
