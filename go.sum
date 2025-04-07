@@ -20,6 +20,8 @@ github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 h1:Jamvg5psRI
 github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/stellar/go v0.0.0-20250213232608-c453f8b35c75 h1:luZ1Kv/3GZ+2EJMoj2H/bfxgOPKm8h753MkHta6Bhbs=
 github.com/stellar/go v0.0.0-20250213232608-c453f8b35c75/go.mod h1:pIh0xYFVnaMP9fLnjFT7URY9Zhwy5wuc6tQkYybKkUY=
+github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4 h1:t+rjWVnE/S886yqdvmsx5fvXgG9LDuu6SIDXEDGVfIc=
+github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4/go.mod h1:pIh0xYFVnaMP9fLnjFT7URY9Zhwy5wuc6tQkYybKkUY=
 github.com/stellar/go-xdr v0.0.0-20231122183749-b53fb00bcac2 h1:OzCVd0SV5qE3ZcDeSFCmOWLZfEWZ3Oe8KtmSOYKEVWE=
 github.com/stellar/go-xdr v0.0.0-20231122183749-b53fb00bcac2/go.mod h1:yoxyU/M8nl9LKeWIoBrbDPQ7Cy+4jxRcWcOayZ4BMps=
 github.com/stretchr/testify v1.9.0 h1:HtqpIVDClZ4nwg75+f6Lvsy/wHu+3BoSGCbBAcpTsTg=

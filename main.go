@@ -13,6 +13,68 @@ import (
 	"github.com/withObsrvr/pluginapi"
 )
 
+// Error types for the processor
+type ErrorType string
+
+const (
+	ErrorTypeConfig     ErrorType = "config"
+	ErrorTypeProcessing ErrorType = "processing"
+	ErrorTypeParsing    ErrorType = "parsing"
+	ErrorTypeValidation ErrorType = "validation"
+)
+
+type ErrorSeverity string
+
+const (
+	ErrorSeverityFatal   ErrorSeverity = "fatal"
+	ErrorSeverityError   ErrorSeverity = "error"
+	ErrorSeverityWarning ErrorSeverity = "warning"
+)
+
+// ProcessorError represents a rich error type for the processor
+type ProcessorError struct {
+	Err             error
+	Type            ErrorType
+	Severity        ErrorSeverity
+	TransactionHash string
+	LedgerSequence  uint32
+	ContractID      string
+	Context         map[string]interface{}
+}
+
+func NewProcessorError(err error, errType ErrorType, severity ErrorSeverity) *ProcessorError {
+	return &ProcessorError{
+		Err:      err,
+		Type:     errType,
+		Severity: severity,
+		Context:  make(map[string]interface{}),
+	}
+}
+
+func (e *ProcessorError) WithTransaction(txHash string) *ProcessorError {
+	e.TransactionHash = txHash
+	return e
+}
+
+func (e *ProcessorError) WithLedger(sequence uint32) *ProcessorError {
+	e.LedgerSequence = sequence
+	return e
+}
+
+func (e *ProcessorError) WithContract(contractID string) *ProcessorError {
+	e.ContractID = contractID
+	return e
+}
+
+func (e *ProcessorError) WithContext(key string, value interface{}) *ProcessorError {
+	e.Context[key] = value
+	return e
+}
+
+func (e *ProcessorError) Error() string {
+	return fmt.Sprintf("%s error: %v", e.Type, e.Err)
+}
+
 // Event types
 const (
 	EventTypeSwap   = "swap"
@@ -20,8 +82,14 @@ const (
 	EventTypeRemove = "remove"
 )
 
-// RouterEvent represents the base structure for router events
+// RouterEvent represents the base structure for router events with dual representation
 type RouterEvent struct {
+	// Raw data for archival
+	RawTopics   []xdr.ScVal     `json:"raw_topics"`
+	RawData     json.RawMessage `json:"raw_data"`
+	RawEventXDR string          `json:"raw_event_xdr"`
+
+	// Decoded data for usability
 	Type           string    `json:"type"`
 	Timestamp      time.Time `json:"timestamp"`
 	LedgerSequence uint32    `json:"ledger_sequence"`
@@ -40,8 +108,14 @@ type SwapEvent struct {
 	Path []string `json:"path"`
 }
 
-// ContractEvent represents a contract event
+// ContractEvent represents a contract event with dual representation
 type ContractEvent struct {
+	// Raw data for archival
+	RawTopics   []xdr.ScVal     `json:"raw_topics"`
+	RawData     json.RawMessage `json:"raw_data"`
+	RawEventXDR string          `json:"raw_event_xdr"`
+
+	// Decoded data for usability
 	Timestamp       time.Time       `json:"timestamp"`
 	LedgerSequence  uint32          `json:"ledger_sequence"`
 	ContractID      string          `json:"contract_id"`
@@ -60,12 +134,20 @@ type SoroswapRouterProcessor struct {
 		AddEvents       uint64
 		RemoveEvents    uint64
 		LastEventTime   time.Time
+		Errors          struct {
+			Processing uint64
+			Parsing    uint64
+			Validation uint64
+		}
 	}
+	startTime time.Time
 }
 
 // New creates a new instance of the plugin
 func New() pluginapi.Plugin {
-	return &SoroswapRouterProcessor{}
+	return &SoroswapRouterProcessor{
+		startTime: time.Now(),
+	}
 }
 
 // Name returns the name of the plugin
@@ -85,12 +167,24 @@ func (p *SoroswapRouterProcessor) Type() pluginapi.PluginType {
 
 // Initialize sets up the processor with the provided configuration
 func (p *SoroswapRouterProcessor) Initialize(config map[string]interface{}) error {
-	// No specific configuration needed for this processor
+	if apiVersion, ok := config["flow_api_version"].(string); ok {
+		if !isCompatibleVersion(apiVersion, "1.0.0") {
+			log.Printf("Warning: Plugin was tested with Flow API v1.0.0, current version is %s", apiVersion)
+		}
+	}
 	return nil
+}
+
+func isCompatibleVersion(current, minimum string) bool {
+	// TODO: Implement proper version comparison
+	return true
 }
 
 // RegisterConsumer registers a consumer with this processor
 func (p *SoroswapRouterProcessor) RegisterConsumer(consumer pluginapi.Consumer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	log.Printf("Registering consumer: %s", consumer.Name())
 	p.consumers = append(p.consumers, consumer)
 }
 
@@ -99,7 +193,7 @@ func encodeContractID(contractId []byte) (string, error) {
 	return strkey.Encode(strkey.VersionByteContract, contractId)
 }
 
-// Process handles router events
+// Process handles router events with improved context handling and error management
 func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Message) error {
 	log.Printf("SoroswapRouterProcessor: Processing message with payload type: %T", msg.Payload)
 
@@ -107,33 +201,75 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 	switch payload := msg.Payload.(type) {
 	case []byte:
 		if err := json.Unmarshal(payload, &contractEvent); err != nil {
-			log.Printf("SoroswapRouterProcessor: Error decoding contract event from bytes: %v", err)
-			return fmt.Errorf("error decoding contract event: %w", err)
+			p.recordError(ErrorTypeParsing)
+			return NewProcessorError(
+				fmt.Errorf("error decoding contract event: %w", err),
+				ErrorTypeParsing,
+				ErrorSeverityError,
+			).WithContract(contractEvent.ContractID)
 		}
 	case json.RawMessage:
 		if err := json.Unmarshal(payload, &contractEvent); err != nil {
-			log.Printf("SoroswapRouterProcessor: Error decoding contract event from RawMessage: %v", err)
-			return fmt.Errorf("error decoding contract event: %w", err)
+			p.recordError(ErrorTypeParsing)
+			return NewProcessorError(
+				fmt.Errorf("error decoding contract event: %w", err),
+				ErrorTypeParsing,
+				ErrorSeverityError,
+			).WithContract(contractEvent.ContractID)
 		}
 	case ContractEvent:
 		contractEvent = payload
 	default:
-		log.Printf("SoroswapRouterProcessor: Unexpected payload type: %T", msg.Payload)
-		return fmt.Errorf("unexpected payload type: %T", msg.Payload)
+		p.recordError(ErrorTypeValidation)
+		return NewProcessorError(
+			fmt.Errorf("unexpected payload type: %T", msg.Payload),
+			ErrorTypeValidation,
+			ErrorSeverityError,
+		)
 	}
 
-	// Add debug logging
-	log.Printf("SoroswapRouterProcessor: Received contract event for contract ID: %s", contractEvent.ContractID)
+	// Check for context cancellation
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled during processing: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		).WithContract(contractEvent.ContractID)
+	}
 
+	// Store raw data for archival
+	contractEvent.RawTopics = contractEvent.Topic
+	contractEvent.RawData = contractEvent.Data
+	if raw, err := json.Marshal(contractEvent); err == nil {
+		contractEvent.RawEventXDR = string(raw)
+	}
+
+	// Process the event with timeout
+	processCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	if err := p.processEvent(processCtx, contractEvent); err != nil {
+		p.recordError(ErrorTypeProcessing)
+		return err
+	}
+
+	return nil
+}
+
+// processEvent handles the actual event processing logic
+func (p *SoroswapRouterProcessor) processEvent(ctx context.Context, event ContractEvent) error {
 	// Check if we have enough topics
-	if len(contractEvent.Topic) < 2 {
-		log.Printf("SoroswapRouterProcessor: Not enough topics in event, skipping")
-		return nil
+	if len(event.Topic) < 2 {
+		return NewProcessorError(
+			fmt.Errorf("not enough topics in event"),
+			ErrorTypeValidation,
+			ErrorSeverityWarning,
+		).WithContract(event.ContractID)
 	}
 
 	// Check the event type from topics
 	var eventType string
-	for _, topic := range contractEvent.Topic {
+	for _, topic := range event.Topic {
 		if topic.Type == xdr.ScValTypeScvSymbol {
 			sym := topic.MustSym()
 			log.Printf("SoroswapRouterProcessor: Found topic symbol: %s", sym)
@@ -189,7 +325,7 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 		} `json:"V0"`
 	}
 
-	if err := json.Unmarshal(contractEvent.Data, &eventData); err != nil {
+	if err := json.Unmarshal(event.Data, &eventData); err != nil {
 		log.Printf("SoroswapRouterProcessor: Error parsing router event data: %v", err)
 		return fmt.Errorf("error parsing router event data: %w", err)
 	}
@@ -197,10 +333,10 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 	// Create base router event
 	routerEvent := RouterEvent{
 		Type:           eventType,
-		Timestamp:      contractEvent.Timestamp,
-		LedgerSequence: contractEvent.LedgerSequence,
-		ContractID:     contractEvent.ContractID,
-		TxHash:         contractEvent.TransactionHash,
+		Timestamp:      event.Timestamp,
+		LedgerSequence: event.LedgerSequence,
+		ContractID:     event.ContractID,
+		TxHash:         event.TransactionHash,
 	}
 
 	// Extract data based on event type
@@ -320,21 +456,70 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 	return nil
 }
 
-// GetStats returns processor statistics
-func (p *SoroswapRouterProcessor) GetStats() struct {
-	ProcessedEvents uint64
-	SwapEvents      uint64
-	AddEvents       uint64
-	RemoveEvents    uint64
-	LastEventTime   time.Time
-} {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.stats
+// recordError updates error statistics
+func (p *SoroswapRouterProcessor) recordError(errType ErrorType) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	switch errType {
+	case ErrorTypeProcessing:
+		p.stats.Errors.Processing++
+	case ErrorTypeParsing:
+		p.stats.Errors.Parsing++
+	case ErrorTypeValidation:
+		p.stats.Errors.Validation++
+	}
 }
 
-// Close implements the Consumer interface
+// GetStats returns the current processor statistics
+func (p *SoroswapRouterProcessor) GetStats() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return map[string]interface{}{
+		"stats":     p.stats,
+		"uptime":    time.Since(p.startTime).String(),
+		"consumers": len(p.consumers),
+	}
+}
+
+// Close handles cleanup
 func (p *SoroswapRouterProcessor) Close() error {
-	// No resources to clean up
 	return nil
+}
+
+// GetSchemaDefinition returns the GraphQL schema for this processor
+func (p *SoroswapRouterProcessor) GetSchemaDefinition() string {
+	return `
+type RouterEvent {
+    type: String!
+    timestamp: String!
+    ledger_sequence: Int!
+    contract_id: String!
+    account: String
+    token_a: String
+    token_b: String
+    amount_a: String
+    amount_b: String
+    tx_hash: String!
+}
+
+type SwapEvent {
+    router_event: RouterEvent!
+    path: [String!]!
+}
+
+type Query {
+    getRouterEvents(contract_id: String): [RouterEvent!]!
+    getSwapEvents(contract_id: String): [SwapEvent!]!
+}
+`
+}
+
+// GetQueryDefinitions returns the GraphQL query definitions
+func (p *SoroswapRouterProcessor) GetQueryDefinitions() string {
+	return `
+    getRouterEvents(contract_id: String): [RouterEvent!]!
+    getSwapEvents(contract_id: String): [SwapEvent!]!
+`
 }
