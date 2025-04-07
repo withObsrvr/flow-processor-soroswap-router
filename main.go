@@ -261,38 +261,54 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 
 	// Check diagnostic events for Soroswap events
 	for _, diagEvent := range contractEvent.DiagnosticEvents {
+		// Log the diagnostic event for debugging
+		log.Printf("Processing diagnostic event: %s", string(diagEvent.Event))
+
 		var event struct {
 			Event struct {
-				Body struct {
+				ContractId []byte `json:"ContractId"`
+				Type       int    `json:"Type"`
+				Body       struct {
 					V0 struct {
 						Topics []struct {
-							Type string `json:"Type"`
-							Str  string `json:"Str"`
-							Sym  string `json:"Sym"`
+							Type  int    `json:"Type"`
+							Sym   string `json:"Sym"`
+							Value string `json:"Value"`
 						} `json:"Topics"`
 						Data struct {
-							Type string `json:"Type"`
+							Type int `json:"Type"`
 							Map  []struct {
 								Key struct {
-									Sym string `json:"Sym"`
+									Type int    `json:"Type"`
+									Sym  string `json:"Sym"`
 								} `json:"Key"`
 								Val struct {
-									Type string `json:"Type"`
-									I128 struct {
+									Type int `json:"Type"`
+									I128 *struct {
+										Hi int64  `json:"Hi"`
 										Lo uint64 `json:"Lo"`
 									} `json:"I128"`
-									Address struct {
-										AccountId struct {
+									Address *struct {
+										Type      int `json:"Type"`
+										AccountId *struct {
 											Ed25519 []byte `json:"Ed25519"`
 										} `json:"AccountId"`
 										ContractId []byte `json:"ContractId"`
 									} `json:"Address"`
+									Vec *[]struct {
+										Type    int `json:"Type"`
+										Address *struct {
+											Type       int    `json:"Type"`
+											ContractId []byte `json:"ContractId"`
+										} `json:"Address"`
+									} `json:"Vec"`
 								} `json:"Val"`
 							} `json:"Map"`
 						} `json:"Data"`
 					} `json:"V0"`
 				} `json:"Body"`
 			} `json:"Event"`
+			InSuccessfulContractCall bool `json:"in_successful_contract_call"`
 		}
 
 		if err := json.Unmarshal(diagEvent.Event, &event); err != nil {
@@ -300,38 +316,46 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 			continue
 		}
 
-		// Check if this is a SoroswapPair event
+		// Check if this is a Soroswap event by looking at the topics
 		if len(event.Event.Body.V0.Topics) >= 2 {
-			if event.Event.Body.V0.Topics[0].Str == "SoroswapPair" {
-				// Determine event type
-				var eventType string
-				switch event.Event.Body.V0.Topics[1].Sym {
-				case "swap":
-					eventType = EventTypeSwap
-				case "add":
-					eventType = EventTypeAdd
-				case "remove":
-					eventType = EventTypeRemove
-				default:
-					log.Printf("SoroswapRouterProcessor: Unknown event type: %s", event.Event.Body.V0.Topics[1].Sym)
-					continue
-				}
+			// Log the topics for debugging
+			for i, topic := range event.Event.Body.V0.Topics {
+				log.Printf("Topic %d: Type=%d, Sym=%s", i, topic.Type, topic.Sym)
+			}
 
-				// Create router event
-				routerEvent := RouterEvent{
-					Type:           eventType,
-					Timestamp:      contractEvent.ClosedAt,
-					LedgerSequence: contractEvent.LedgerSequence,
-					ContractID:     contractEvent.ContractID,
-					TxHash:         contractEvent.TransactionHash,
-				}
+			// Check for Soroswap event signature
+			firstTopic := event.Event.Body.V0.Topics[0]
+			secondTopic := event.Event.Body.V0.Topics[1]
 
-				// Extract data from the map based on event type
-				for _, entry := range event.Event.Body.V0.Data.Map {
-					switch entry.Key.Sym {
-					// Common fields for all event types
-					case "to":
-						if entry.Val.Address.AccountId.Ed25519 != nil {
+			// Determine event type
+			var eventType string
+			if firstTopic.Sym == "swap" || secondTopic.Sym == "swap" {
+				eventType = EventTypeSwap
+			} else if firstTopic.Sym == "add" || secondTopic.Sym == "add" {
+				eventType = EventTypeAdd
+			} else if firstTopic.Sym == "remove" || secondTopic.Sym == "remove" {
+				eventType = EventTypeRemove
+			} else {
+				log.Printf("Not a Soroswap event: first topic=%s, second topic=%s", firstTopic.Sym, secondTopic.Sym)
+				continue
+			}
+
+			// Create router event
+			routerEvent := RouterEvent{
+				Type:           eventType,
+				Timestamp:      contractEvent.ClosedAt,
+				LedgerSequence: contractEvent.LedgerSequence,
+				ContractID:     contractEvent.ContractID,
+				TxHash:         contractEvent.TransactionHash,
+			}
+
+			// Extract data from the map
+			for _, entry := range event.Event.Body.V0.Data.Map {
+				log.Printf("Processing map entry: key=%s", entry.Key.Sym)
+				switch entry.Key.Sym {
+				case "to":
+					if entry.Val.Address != nil {
+						if entry.Val.Address.AccountId != nil && entry.Val.Address.AccountId.Ed25519 != nil {
 							if accountID, err := strkey.Encode(strkey.VersionByteAccountID, entry.Val.Address.AccountId.Ed25519); err == nil {
 								routerEvent.Account = accountID
 							}
@@ -340,110 +364,87 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 								routerEvent.Account = contractID
 							}
 						}
-
-					// Swap event fields
-					case "amount_0_in", "amount0_in":
+					}
+				case "amount0", "amount_a", "amount_0_in", "amount0_in":
+					if entry.Val.I128 != nil {
 						routerEvent.AmountA = fmt.Sprintf("%d", entry.Val.I128.Lo)
-					case "amount_1_out", "amount1_out":
+					}
+				case "amount1", "amount_b", "amount_1_out", "amount1_out":
+					if entry.Val.I128 != nil {
 						routerEvent.AmountB = fmt.Sprintf("%d", entry.Val.I128.Lo)
-					case "path":
-						if eventType == EventTypeSwap {
-							// Extract path information for swap events
-							var pathData struct {
-								Vec []struct {
-									Address struct {
-										ContractId []byte `json:"ContractId"`
-									} `json:"Address"`
-								} `json:"Vec"`
+					}
+				case "token0", "token_a":
+					if entry.Val.Address != nil && entry.Val.Address.ContractId != nil {
+						if contractID, err := encodeContractID(entry.Val.Address.ContractId); err == nil {
+							routerEvent.TokenA = contractID
+						}
+					}
+				case "token1", "token_b":
+					if entry.Val.Address != nil && entry.Val.Address.ContractId != nil {
+						if contractID, err := encodeContractID(entry.Val.Address.ContractId); err == nil {
+							routerEvent.TokenB = contractID
+						}
+					}
+				case "path":
+					if entry.Val.Vec != nil {
+						// Extract path information for swap events
+						path := *entry.Val.Vec
+						if len(path) >= 2 {
+							if path[0].Address != nil && path[0].Address.ContractId != nil {
+								if contractID, err := encodeContractID(path[0].Address.ContractId); err == nil {
+									routerEvent.TokenA = contractID
+								}
 							}
-							if pathBytes, err := json.Marshal(entry.Val); err == nil {
-								if err := json.Unmarshal(pathBytes, &pathData); err == nil && len(pathData.Vec) >= 2 {
-									// First token in path
-									if pathData.Vec[0].Address.ContractId != nil {
-										if contractID, err := encodeContractID(pathData.Vec[0].Address.ContractId); err == nil {
-											routerEvent.TokenA = contractID
-										}
-									}
-									// Last token in path
-									if pathData.Vec[len(pathData.Vec)-1].Address.ContractId != nil {
-										if contractID, err := encodeContractID(pathData.Vec[len(pathData.Vec)-1].Address.ContractId); err == nil {
-											routerEvent.TokenB = contractID
-										}
-									}
+							if path[len(path)-1].Address != nil && path[len(path)-1].Address.ContractId != nil {
+								if contractID, err := encodeContractID(path[len(path)-1].Address.ContractId); err == nil {
+									routerEvent.TokenB = contractID
 								}
 							}
 						}
-
-					// Add/Remove event fields
-					case "token0", "token_a":
-						if entry.Val.Address.ContractId != nil {
-							if contractID, err := encodeContractID(entry.Val.Address.ContractId); err == nil {
-								routerEvent.TokenA = contractID
-							}
-						}
-					case "token1", "token_b":
-						if entry.Val.Address.ContractId != nil {
-							if contractID, err := encodeContractID(entry.Val.Address.ContractId); err == nil {
-								routerEvent.TokenB = contractID
-							}
-						}
-					case "amount0", "amount_a":
-						routerEvent.AmountA = fmt.Sprintf("%d", entry.Val.I128.Lo)
-					case "amount1", "amount_b":
-						routerEvent.AmountB = fmt.Sprintf("%d", entry.Val.I128.Lo)
 					}
 				}
+			}
 
-				// Add debug logging after data extraction
-				log.Printf("Extracted event data: %+v", routerEvent)
-				log.Printf("Router Event Details:")
-				log.Printf("  Type: %s", routerEvent.Type)
-				log.Printf("  Account: %s", routerEvent.Account)
-				log.Printf("  TokenA: %s", routerEvent.TokenA)
-				log.Printf("  TokenB: %s", routerEvent.TokenB)
-				log.Printf("  AmountA: %s", routerEvent.AmountA)
-				log.Printf("  AmountB: %s", routerEvent.AmountB)
-				log.Printf("  TxHash: %s", routerEvent.TxHash)
-				log.Printf("  ContractID: %s", routerEvent.ContractID)
+			// Log the extracted event data
+			log.Printf("Extracted Soroswap event: %+v", routerEvent)
 
-				// Update stats
-				p.mu.Lock()
-				p.stats.ProcessedEvents++
-				switch eventType {
-				case EventTypeSwap:
-					p.stats.SwapEvents++
-				case EventTypeAdd:
-					p.stats.AddEvents++
-				case EventTypeRemove:
-					p.stats.RemoveEvents++
-				}
-				p.stats.LastEventTime = time.Now()
-				p.mu.Unlock()
+			// Update stats
+			p.mu.Lock()
+			p.stats.ProcessedEvents++
+			switch eventType {
+			case EventTypeSwap:
+				p.stats.SwapEvents++
+			case EventTypeAdd:
+				p.stats.AddEvents++
+			case EventTypeRemove:
+				p.stats.RemoveEvents++
+			}
+			p.stats.LastEventTime = time.Now()
+			p.mu.Unlock()
 
-				// Forward the event to downstream consumers
-				eventBytes, err := json.Marshal(routerEvent)
-				if err != nil {
-					return fmt.Errorf("error marshaling router event: %w", err)
-				}
+			// Forward the event to downstream consumers
+			eventBytes, err := json.Marshal(routerEvent)
+			if err != nil {
+				return fmt.Errorf("error marshaling router event: %w", err)
+			}
 
-				log.Printf("Processing %s event: %s (tokens: %s/%s, amounts: %s/%s)",
-					routerEvent.Type, routerEvent.ContractID, routerEvent.TokenA, routerEvent.TokenB,
-					routerEvent.AmountA, routerEvent.AmountB)
+			log.Printf("Forwarding Soroswap %s event: %s (tokens: %s/%s, amounts: %s/%s)",
+				eventType, routerEvent.ContractID, routerEvent.TokenA, routerEvent.TokenB,
+				routerEvent.AmountA, routerEvent.AmountB)
 
-				// Forward to all registered consumers
-				log.Printf("Forwarding event to %d consumers", len(p.consumers))
-				for _, consumer := range p.consumers {
-					log.Printf("Forwarding to consumer: %s", consumer.Name())
-					if err := consumer.Process(ctx, pluginapi.Message{
-						Payload:   eventBytes,
-						Timestamp: time.Now(),
-						Metadata: map[string]interface{}{
-							"event_type": eventType,
-							"data_type":  "router_events",
-						},
-					}); err != nil {
-						return fmt.Errorf("error in consumer chain: %w", err)
-					}
+			// Forward to all registered consumers
+			log.Printf("Forwarding to %d consumers", len(p.consumers))
+			for _, consumer := range p.consumers {
+				log.Printf("Forwarding to consumer: %s", consumer.Name())
+				if err := consumer.Process(ctx, pluginapi.Message{
+					Payload:   eventBytes,
+					Timestamp: time.Now(),
+					Metadata: map[string]interface{}{
+						"event_type": eventType,
+						"data_type":  "router_events",
+					},
+				}); err != nil {
+					return fmt.Errorf("error in consumer chain: %w", err)
 				}
 			}
 		}
