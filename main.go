@@ -320,23 +320,42 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 		if len(event.Event.Body.V0.Topics) >= 2 {
 			// Log the topics for debugging
 			for i, topic := range event.Event.Body.V0.Topics {
-				log.Printf("Topic %d: Type=%d, Sym=%s", i, topic.Type, topic.Sym)
+				log.Printf("Topic %d: Type=%d, Sym=%s, Value=%s", i, topic.Type, topic.Sym, topic.Value)
 			}
 
 			// Check for Soroswap event signature
 			firstTopic := event.Event.Body.V0.Topics[0]
 			secondTopic := event.Event.Body.V0.Topics[1]
 
+			// Check if this is a Soroswap event
+			isSoroswapEvent := false
+			if firstTopic.Type == 14 { // Type 14 is Str
+				if firstTopic.Value == "SoroswapRouter" || firstTopic.Value == "SoroswapPair" {
+					isSoroswapEvent = true
+				}
+			}
+
+			if !isSoroswapEvent {
+				log.Printf("Not a Soroswap event: first topic type=%d value=%s", firstTopic.Type, firstTopic.Value)
+				continue
+			}
+
 			// Determine event type
 			var eventType string
-			if firstTopic.Sym == "swap" || secondTopic.Sym == "swap" {
-				eventType = EventTypeSwap
-			} else if firstTopic.Sym == "add" || secondTopic.Sym == "add" {
-				eventType = EventTypeAdd
-			} else if firstTopic.Sym == "remove" || secondTopic.Sym == "remove" {
-				eventType = EventTypeRemove
+			if secondTopic.Type == 15 { // Type 15 is Sym
+				switch secondTopic.Sym {
+				case "swap":
+					eventType = EventTypeSwap
+				case "add":
+					eventType = EventTypeAdd
+				case "remove":
+					eventType = EventTypeRemove
+				default:
+					log.Printf("Unknown Soroswap event type: %s", secondTopic.Sym)
+					continue
+				}
 			} else {
-				log.Printf("Not a Soroswap event: first topic=%s, second topic=%s", firstTopic.Sym, secondTopic.Sym)
+				log.Printf("Second topic is not a symbol: type=%d", secondTopic.Type)
 				continue
 			}
 
@@ -365,6 +384,44 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 							}
 						}
 					}
+				case "amounts":
+					if entry.Val.Vec != nil {
+						// Parse the amounts vector
+						var amounts []struct {
+							Type int `json:"Type"`
+							I128 *struct {
+								Hi int64  `json:"Hi"`
+								Lo uint64 `json:"Lo"`
+							} `json:"I128"`
+						}
+						if amountsBytes, err := json.Marshal(entry.Val.Vec); err == nil {
+							if err := json.Unmarshal(amountsBytes, &amounts); err == nil && len(amounts) >= 2 {
+								// Extract amounts
+								if amounts[0].I128 != nil {
+									routerEvent.AmountA = fmt.Sprintf("%d", amounts[0].I128.Lo)
+								}
+								if amounts[1].I128 != nil {
+									routerEvent.AmountB = fmt.Sprintf("%d", amounts[1].I128.Lo)
+								}
+							}
+						}
+					}
+				case "path":
+					if entry.Val.Vec != nil {
+						path := *entry.Val.Vec
+						if len(path) >= 2 {
+							if path[0].Address != nil && path[0].Address.ContractId != nil {
+								if contractID, err := encodeContractID(path[0].Address.ContractId); err == nil {
+									routerEvent.TokenA = contractID
+								}
+							}
+							if path[len(path)-1].Address != nil && path[len(path)-1].Address.ContractId != nil {
+								if contractID, err := encodeContractID(path[len(path)-1].Address.ContractId); err == nil {
+									routerEvent.TokenB = contractID
+								}
+							}
+						}
+					}
 				case "amount0", "amount_a", "amount_0_in", "amount0_in":
 					if entry.Val.I128 != nil {
 						routerEvent.AmountA = fmt.Sprintf("%d", entry.Val.I128.Lo)
@@ -383,23 +440,6 @@ func (p *SoroswapRouterProcessor) Process(ctx context.Context, msg pluginapi.Mes
 					if entry.Val.Address != nil && entry.Val.Address.ContractId != nil {
 						if contractID, err := encodeContractID(entry.Val.Address.ContractId); err == nil {
 							routerEvent.TokenB = contractID
-						}
-					}
-				case "path":
-					if entry.Val.Vec != nil {
-						// Extract path information for swap events
-						path := *entry.Val.Vec
-						if len(path) >= 2 {
-							if path[0].Address != nil && path[0].Address.ContractId != nil {
-								if contractID, err := encodeContractID(path[0].Address.ContractId); err == nil {
-									routerEvent.TokenA = contractID
-								}
-							}
-							if path[len(path)-1].Address != nil && path[len(path)-1].Address.ContractId != nil {
-								if contractID, err := encodeContractID(path[len(path)-1].Address.ContractId); err == nil {
-									routerEvent.TokenB = contractID
-								}
-							}
 						}
 					}
 				}
@@ -589,9 +629,26 @@ func (p *SoroswapRouterProcessor) processEventWithType(ctx context.Context, cont
 			}
 		case "amounts":
 			// Handle swap event amounts
-			if entry.Val.Vec != nil && len(entry.Val.Vec) >= 2 {
-				routerEvent.AmountA = fmt.Sprintf("%d", entry.Val.Vec[0].I128.Lo)
-				routerEvent.AmountB = fmt.Sprintf("%d", entry.Val.Vec[len(entry.Val.Vec)-1].I128.Lo)
+			if entry.Val.Vec != nil {
+				// Parse the amounts vector
+				var amounts []struct {
+					Type int `json:"Type"`
+					I128 *struct {
+						Hi int64  `json:"Hi"`
+						Lo uint64 `json:"Lo"`
+					} `json:"I128"`
+				}
+				if amountsBytes, err := json.Marshal(entry.Val.Vec); err == nil {
+					if err := json.Unmarshal(amountsBytes, &amounts); err == nil && len(amounts) >= 2 {
+						// Extract amounts
+						if amounts[0].I128 != nil {
+							routerEvent.AmountA = fmt.Sprintf("%d", amounts[0].I128.Lo)
+						}
+						if amounts[1].I128 != nil {
+							routerEvent.AmountB = fmt.Sprintf("%d", amounts[1].I128.Lo)
+						}
+					}
+				}
 			}
 		case "token0", "token_a":
 			// Handle add/remove event token A
